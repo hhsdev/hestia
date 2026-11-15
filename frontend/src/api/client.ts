@@ -3,6 +3,7 @@ import {
   AOITrendPayload,
   CalendarSeriesResponse,
   HealthMetadata,
+  KPISummaryResponse,
   SpatialSummaryResponse,
   TrendSeriesResponse,
 } from "../types/api";
@@ -22,6 +23,22 @@ export async function fetchSpatialSummary(
   });
   if (!res.ok) {
     throw new Error(`Spatial Summary API failed: ${res.status} ${res.statusText}`);
+  }
+  return res.json();
+}
+
+export async function fetchKpiSummary(
+  payload: AOIQueryPayload,
+  signal?: AbortSignal
+): Promise<KPISummaryResponse> {
+  const res = await fetch(`${API_BASE_URL}/api/aoi/kpis`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    signal,
+  });
+  if (!res.ok) {
+    throw new Error(`KPI Summary API failed: ${res.status} ${res.statusText}`);
   }
   return res.json();
 }

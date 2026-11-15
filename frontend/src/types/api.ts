@@ -18,6 +18,8 @@ export interface AOIQueryPayload {
   date_start: string;
   date_end: string;
   sensor_mode: SensorMode;
+  max_resolution?: number;
+  viewport_bbox?: [number, number, number, number];
 }
 
 export interface AOITrendPayload extends AOIQueryPayload {
@@ -33,6 +35,13 @@ export interface SpatialHexDatum {
 export interface SpatialSummaryResponse {
   status: string;
   data: SpatialHexDatum[];
+}
+
+export interface KPISummaryResponse {
+  status: string;
+  total_fires: number;
+  active_zones: number;
+  mean_frp: number;
 }
 
 export interface CalendarSummary {
@@ -73,6 +82,7 @@ export interface TrendSeriesResponse {
 export interface HealthMetadata {
   source_mode?: string;
   h3_resolution?: number;
+  coarse_weekly_outside_study_area?: boolean;
   calibration_alpha_count?: number;
   calibration_gamma_frp?: number;
   overlap_sample_size?: number;

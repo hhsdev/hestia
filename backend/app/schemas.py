@@ -4,7 +4,7 @@ Pydantic API Schemas strictly adhering to Section 3 of project_manifest.md.
 
 from __future__ import annotations
 
-from typing import List, Literal
+from typing import List, Literal, Optional, Tuple
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -33,6 +33,8 @@ class AOIQueryRequest(BaseModel):
     date_start: str = Field(..., examples=["2015-01-01"])
     date_end: str = Field(..., examples=["2025-12-31"])
     sensor_mode: str = Field(default="harmonized", examples=["harmonized"])
+    max_resolution: Optional[int] = Field(default=None, ge=0, le=8)
+    viewport_bbox: Optional[Tuple[float, float, float, float]] = None
 
     @field_validator("sensor_mode")
     @classmethod
@@ -62,6 +64,13 @@ class SpatialHexRecord(BaseModel):
 class SpatialSummaryResponse(BaseModel):
     status: str = "success"
     data: List[SpatialHexRecord]
+
+
+class KPISummaryResponse(BaseModel):
+    status: str = "success"
+    total_fires: int
+    active_zones: int
+    mean_frp: float
 
 
 class CalendarSeasonSummary(BaseModel):

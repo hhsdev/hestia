@@ -18,10 +18,13 @@ import {
 import {
   fetchCalendarSeries,
   fetchHealthMetadata,
+  fetchKpiSummary,
   fetchSpatialSummary,
   fetchTrendSeries,
 } from "./api/client";
 import { CalendarHeatmap } from "./components/CalendarHeatmap";
+import * as h3 from "h3-js";
+import { MALAYSIA_PRESET_AOIS } from "./constants/presets";
 import { ClimatologyChart } from "./components/ClimatologyChart";
 import { MapView } from "./components/MapView";
 import { InfoTooltip, Tooltip } from "./components/Tooltip";
@@ -58,11 +61,37 @@ const WORLD_AOI: GeoJSONPolygon = {
   ],
 };
 
+// The region the statistics and charts describe when the page first loads.
+// The map itself always draws the whole world, so the globe stays populated
+// while the numbers stay meaningful for somewhere in particular.
+const DEFAULT_ANALYSIS_AOI: GeoJSONPolygon =
+  MALAYSIA_PRESET_AOIS[0]?.polygon ?? WORLD_AOI;
+
+// Detections outside the study area are stored one bucket per week, stamped on
+// that week's Monday. Shown on a daily view they would read as a huge Monday
+// spike and six empty days, so the daily view is limited to the study area,
+// which is stored day by day. Fine cells are resolution 8; coarse ones are 4.
+const FINE_GRID_RESOLUTION = 8;
+
 type PlaybackSpeed = 1 | 2 | 4;
 
 export const App: React.FC = () => {
-  const [aoi, setAoi] = useState<GeoJSONPolygon>(WORLD_AOI);
+  const [aoi, setAoi] = useState<GeoJSONPolygon>(DEFAULT_ANALYSIS_AOI);
+  // False until the user draws something: the default region feeds the
+  // headline figures, but nothing is outlined on a map nobody has touched.
   const [hasCustomAoi, setHasCustomAoi] = useState<boolean>(false);
+  // Aggregated KPI figures for the selected analysis AOI & slice.
+  const [regionKpis, setRegionKpis] = useState<{
+    totalFires: number;
+    activeZoneCount: number;
+    avgFrp: number;
+  }>({
+    totalFires: 0,
+    activeZoneCount: 0,
+    avgFrp: 0,
+  });
+  // True when the dataset stores the world outside the study area weekly.
+  const [coarseWeekly, setCoarseWeekly] = useState<boolean>(false);
 
   const [dataBounds, setDataBounds] = useState<{ min: string; max: string }>({
     min: "2005-01-01",
@@ -112,6 +141,39 @@ export const App: React.FC = () => {
   const [loadingTrend, setLoadingTrend] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
+  // Zoom- and viewport-bucketed spatial resolution requested for map rendering
+  const [spatialView, setSpatialView] = useState<{
+    maxResolution: number;
+    viewportBbox: [number, number, number, number] | null;
+  }>({
+    maxResolution: 2,
+    viewportBbox: null,
+  });
+
+  const handleMapViewChange = useCallback(
+    (next: {
+      maxResolution: number;
+      viewportBbox: [number, number, number, number] | null;
+    }) => {
+      setSpatialView((prev) => {
+        if (
+          prev.maxResolution === next.maxResolution &&
+          ((prev.viewportBbox === null && next.viewportBbox === null) ||
+            (prev.viewportBbox !== null &&
+              next.viewportBbox !== null &&
+              prev.viewportBbox[0] === next.viewportBbox[0] &&
+              prev.viewportBbox[1] === next.viewportBbox[1] &&
+              prev.viewportBbox[2] === next.viewportBbox[2] &&
+              prev.viewportBbox[3] === next.viewportBbox[3]))
+        ) {
+          return prev;
+        }
+        return next;
+      });
+    },
+    []
+  );
+
   // Bounded client-side frame cache for silky-smooth animated loop playback
   const spatialCacheRef = useRef<Map<string, SpatialHexDatum[]>>(new Map());
   const aoiKey = useMemo(() => JSON.stringify(aoi), [aoi]);
@@ -125,6 +187,7 @@ export const App: React.FC = () => {
         const minDt = meta.date_min || "2005-01-01";
         const maxDt = meta.date_max || "2026-11-10";
         setDataBounds({ min: minDt, max: maxDt });
+        setCoarseWeekly(Boolean(meta.coarse_weekly_outside_study_area));
         setBoundsStart(minDt);
         setBoundsEnd(maxDt);
         setCursorDate(maxDt);
@@ -280,6 +343,16 @@ export const App: React.FC = () => {
     timescale,
   ]);
 
+  const mapAoi = hasCustomAoi ? aoi : WORLD_AOI;
+  const mapAoiKey = hasCustomAoi ? aoiKey : "world";
+  const mapMaxRes = hasCustomAoi
+    ? Math.max(spatialView.maxResolution, 4)
+    : spatialView.maxResolution;
+  const mapViewportBbox = spatialView.viewportBbox;
+  const mapViewKey = `${mapMaxRes}|${
+    mapViewportBbox ? mapViewportBbox.join(",") : "global"
+  }`;
+
   // Fetch helper with bounded client-side frame cache (up to 450 slices)
   const loadSpatialSlice = useCallback(
     async (
@@ -287,16 +360,18 @@ export const App: React.FC = () => {
       sliceEnd: string,
       signal: AbortSignal
     ): Promise<SpatialHexDatum[]> => {
-      const cacheKey = `${aoiKey}|${sensorMode}|${sliceStart}|${sliceEnd}`;
+      const cacheKey = `${mapAoiKey}|${mapViewKey}|${sensorMode}|${sliceStart}|${sliceEnd}`;
       const hit = spatialCacheRef.current.get(cacheKey);
       if (hit) return hit;
 
       const res = await fetchSpatialSummary(
         {
-          aoi,
+          aoi: mapAoi,
           date_start: sliceStart,
           date_end: sliceEnd,
           sensor_mode: sensorMode,
+          max_resolution: mapMaxRes,
+          ...(mapViewportBbox ? { viewport_bbox: mapViewportBbox } : {}),
         },
         signal
       );
@@ -310,7 +385,7 @@ export const App: React.FC = () => {
       spatialCacheRef.current.set(cacheKey, res.data);
       return res.data;
     },
-    [aoi, aoiKey, sensorMode]
+    [mapAoi, mapAoiKey, mapMaxRes, mapViewportBbox, mapViewKey, sensorMode]
   );
 
   // Spatial map summary + coordinated playback timer with next-frame prefetch
@@ -321,7 +396,7 @@ export const App: React.FC = () => {
     let cancelled = false;
 
     const run = async () => {
-      const cacheKey = `${aoiKey}|${sensorMode}|${activeSlice.start}|${activeSlice.end}`;
+      const cacheKey = `${mapAoiKey}|${mapViewKey}|${sensorMode}|${activeSlice.start}|${activeSlice.end}`;
       const cached = spatialCacheRef.current.get(cacheKey);
       if (cached) {
         setHexData(cached);
@@ -407,6 +482,9 @@ export const App: React.FC = () => {
   }, [
     metadataReady,
     aoiKey,
+    hasCustomAoi,
+    mapAoiKey,
+    mapViewKey,
     sensorMode,
     activeSlice.start,
     activeSlice.end,
@@ -460,7 +538,7 @@ export const App: React.FC = () => {
   }, []);
 
   const handleResetAoi = useCallback(() => {
-    setAoi(WORLD_AOI);
+    setAoi(DEFAULT_ANALYSIS_AOI);
     setHasCustomAoi(false);
   }, []);
 
@@ -470,15 +548,67 @@ export const App: React.FC = () => {
     [activeSlice.start, activeSlice.end]
   );
 
+  // Headline KPI aggregation computed server-side so multi-year (5y+) intervals
+  // never download or reduce millions of per-hex rows in the browser.
+  useEffect(() => {
+    if (!metadataReady) return;
+    const controller = new AbortController();
+    let cancelled = false;
+
+    fetchKpiSummary(
+      {
+        aoi,
+        date_start: activeSlice.start,
+        date_end: activeSlice.end,
+        sensor_mode: sensorMode,
+      },
+      controller.signal
+    )
+      .then((res) => {
+        if (!cancelled) {
+          setRegionKpis({
+            totalFires: res.total_fires,
+            activeZoneCount: res.active_zones,
+            avgFrp: res.mean_frp,
+          });
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setRegionKpis({ totalFires: 0, activeZoneCount: 0, avgFrp: 0 });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [
+    metadataReady,
+    aoiKey,
+    aoi,
+    sensorMode,
+    activeSlice.start,
+    activeSlice.end,
+  ]);
+
+  // Daily view: the backend withholds weekly-stored cells from windows shorter
+  // than a week; this guards the map the same way and tells MapView to say so.
+  const dailyStudyAreaOnly = timescale === "daily" && coarseWeekly;
+  const mapHexData = useMemo(() => {
+    if (!dailyStudyAreaOnly) return hexData;
+    const minExpectedRes = Math.min(FINE_GRID_RESOLUTION, mapMaxRes);
+    return hexData.filter((d) => {
+      try {
+        return h3.getResolution(d.h3_index) >= minExpectedRes;
+      } catch {
+        return true;
+      }
+    });
+  }, [hexData, dailyStudyAreaOnly, mapMaxRes]);
+
   // Compute top-level KPI metrics for the active viewing slice & loop range anomalies
   const kpiStats = useMemo(() => {
-    const totalFires = hexData.reduce((acc, h) => acc + h.total_fires, 0);
-    const weightedFrp = hexData.reduce(
-      (acc, h) => acc + h.mean_frp * h.total_fires,
-      0
-    );
-    const avgFrp = totalFires > 0 ? weightedFrp / totalFires : 0;
-
     let anomalyWeeks = 0;
     let peakAnomaly: CalendarTimeSeriesPoint | null = null;
     for (const pt of calendarSeries) {
@@ -491,13 +621,13 @@ export const App: React.FC = () => {
     }
 
     return {
-      totalFires,
-      activeZoneCount: hexData.length,
-      avgFrp,
+      totalFires: regionKpis.totalFires,
+      activeZoneCount: regionKpis.activeZoneCount,
+      avgFrp: regionKpis.avgFrp,
       anomalyWeeks,
       peakAnomaly,
     };
-  }, [hexData, calendarSeries, boundsStart, boundsEnd]);
+  }, [regionKpis, calendarSeries, boundsStart, boundsEnd]);
 
   return (
     <div className="min-h-screen flex flex-col bg-slate-950 text-slate-100">
@@ -891,25 +1021,27 @@ export const App: React.FC = () => {
           </div>
         </div>
 
-        {/* Main Split Workspace: Left Interactive Map (50%) | Right Calendar & Trend (50%) */}
-        <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-3 min-h-[640px]">
-          {/* Left Column: Interactive Map UI */}
-          <div className="lg:col-span-6 h-[460px] lg:h-auto flex flex-col">
+        {/* Workspace: full-width Interactive Map on top, Calendar & Trend side by side below */}
+        <div className="flex flex-col gap-3">
+          {/* Top Row: Interactive Map UI (full width) */}
+          <div className="h-[460px] lg:h-[60vh] lg:min-h-[480px] lg:max-h-[760px] flex flex-col">
             <MapView
-              hexData={hexData}
+              hexData={mapHexData}
+              dailyStudyAreaOnly={dailyStudyAreaOnly}
               aoi={aoi}
               hasCustomAoi={hasCustomAoi}
               onChangeAoi={handleCustomAoi}
               onResetAoi={handleResetAoi}
+              onViewChange={handleMapViewChange}
               sensorMode={sensorMode}
               activeSliceLabel={activeSlice.label}
               loading={loadingMap || loadingCalendar}
             />
           </div>
 
-          {/* Right Column: Burning Activity Calendar & Burning Activity Trend */}
-          <div className="lg:col-span-6 flex flex-col gap-3">
-            <div className="flex-[1.25] min-h-[280px]">
+          {/* Bottom Row: Burning Activity Calendar | Burning Activity Trend */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+            <div className="h-[360px]">
               <CalendarHeatmap
                 timeSeries={calendarSeries}
                 summary={calendarSummary}
@@ -919,7 +1051,7 @@ export const App: React.FC = () => {
               />
             </div>
 
-            <div className="flex-1 min-h-[235px]">
+            <div className="h-[360px]">
               <ClimatologyChart
                 trendPoints={trendSeries}
                 timescale={timescale}

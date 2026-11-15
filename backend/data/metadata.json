@@ -1,0 +1,21 @@
+{
+  "source_mode": "nasa_firms_csv",
+  "h3_resolution": 8,
+  "h3_resolution_fine": 8,
+  "h3_resolution_coarse": 4,
+  "study_area_bbox": [
+    92.0,
+    -12.0,
+    142.0,
+    23.0
+  ],
+  "coarse_weekly_outside_study_area": true,
+  "calibration_scope": "study_area_fine_daily_grid",
+  "calibration_alpha_count": 1.7199,
+  "calibration_gamma_frp": 0.3477,
+  "overlap_sample_size": 228038,
+  "total_hex_days": 8673695,
+  "unique_active_h3_cells": 1616213,
+  "date_min": "2019-12-30",
+  "date_max": "2025-12-31"
+}

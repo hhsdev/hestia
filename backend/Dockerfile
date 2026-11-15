@@ -6,8 +6,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     DATA_DIR=/data
 
-COPY requirements.txt .
+COPY requirements.txt requirements-etl.txt ./
 RUN pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir -r requirements-etl.txt && \
     python -c "import duckdb; con = duckdb.connect(); con.execute('INSTALL spatial; LOAD spatial;')"
 
 COPY . .

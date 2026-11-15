@@ -1,0 +1,4 @@
+# Dependencies for rebuilding the dataset from raw NASA FIRMS archives:
+#   python -m scripts.harmonize_data
+-r requirements.txt
+polars>=1.0.0

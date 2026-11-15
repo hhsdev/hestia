@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.analytics import (
     query_calendar_series,
+    query_kpi_summary,
     query_spatial_summary,
     query_trend_series,
 )
@@ -20,6 +21,7 @@ from app.schemas import (
     AOIQueryRequest,
     AOITrendRequest,
     CalendarSeriesResponse,
+    KPISummaryResponse,
     SpatialSummaryResponse,
     TrendSeriesResponse,
 )
@@ -59,6 +61,18 @@ def get_health() -> Dict:
 @app.post("/api/aoi/spatial-summary", response_model=SpatialSummaryResponse)
 def post_spatial_summary(payload: AOIQueryRequest) -> SpatialSummaryResponse:
     return query_spatial_summary(
+        aoi_dict=payload.aoi.model_dump(),
+        date_start=payload.date_start,
+        date_end=payload.date_end,
+        sensor_mode=payload.sensor_mode,
+        max_resolution=payload.max_resolution,
+        viewport_bbox=payload.viewport_bbox,
+    )
+
+
+@app.post("/api/aoi/kpis", response_model=KPISummaryResponse)
+def post_kpi_summary(payload: AOIQueryRequest) -> KPISummaryResponse:
+    return query_kpi_summary(
         aoi_dict=payload.aoi.model_dump(),
         date_start=payload.date_start,
         date_end=payload.date_end,

@@ -1,7 +1,8 @@
+# Runtime dependencies for serving the pre-built dataset.
+# The ETL (scripts/) additionally needs polars -- see requirements-etl.txt.
 fastapi>=0.111.0
 uvicorn>=0.30.0
 duckdb>=1.0.0
-polars>=1.0.0
 numpy>=1.26.0
 h3>=4.1.0
 pydantic>=2.7.0

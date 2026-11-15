@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import calendar
 from datetime import date, datetime, timedelta
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from app.db import db_engine
@@ -15,6 +15,7 @@ from app.schemas import (
     CalendarSeasonSummary,
     CalendarSeriesResponse,
     CalendarTimeSeriesPoint,
+    KPISummaryResponse,
     SpatialHexRecord,
     SpatialSummaryResponse,
     TimescaleType,
@@ -27,6 +28,20 @@ SENSOR_COLUMN_MAP: Dict[str, Tuple[str, str]] = {
     "modis": ("modis_count", "modis_frp"),
     "viirs": ("viirs_count", "viirs_frp"),
 }
+
+
+# H3 index text carries its resolution in the second hex digit. The study
+# area is stored on the fine resolution-8 grid, day by day; coarser cells hold
+# one bucket per week (see scripts/harmonize_data.py).
+_FINE_CELL_SQL = "substr(h3_index, 2, 1) = '8'"
+
+
+def _weekly_buckets_outside_study_area() -> bool:
+    return bool((db_engine.metadata or {}).get("coarse_weekly_outside_study_area"))
+
+
+def _parse_iso_date(value: str) -> date:
+    return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
 
 
 def _iso_week_to_mmdd(week_num: int, is_end: bool = False) -> str:
@@ -87,44 +102,161 @@ def _detect_critical_fire_season(weekly_means: Dict[int, float]) -> Tuple[str, s
     return (start_mmdd, end_mmdd)
 
 
+def _viewport_sql_filter(
+    viewport_bbox: Optional[Tuple[float, float, float, float]],
+) -> Tuple[Optional[str], List]:
+    """Build an optional `active_cells` predicate for the visible map viewport."""
+    if not viewport_bbox or len(viewport_bbox) != 4:
+        return (None, [])
+
+    west, south, east, north = (float(v) for v in viewport_bbox)
+    south = max(-90.0, min(90.0, south))
+    north = max(-90.0, min(90.0, north))
+    if south > north:
+        south, north = north, south
+
+    if west <= -179.9 and east >= 179.9 and south <= -89.9 and north >= 89.9:
+        return (None, [])
+
+    if west <= east:
+        if east - west >= 359.9:
+            return (
+                "h3_index IN (SELECT h3_index FROM active_cells WHERE cell_lat BETWEEN ? AND ?)",
+                [south, north],
+            )
+        return (
+            "h3_index IN (SELECT h3_index FROM active_cells "
+            "WHERE cell_lon BETWEEN ? AND ? AND cell_lat BETWEEN ? AND ?)",
+            [west, east, south, north],
+        )
+
+    return (
+        "h3_index IN (SELECT h3_index FROM active_cells "
+        "WHERE (cell_lon >= ? OR cell_lon <= ?) AND cell_lat BETWEEN ? AND ?)",
+        [west, east, south, north],
+    )
+
+
+def _h3_group_expr(max_resolution: Optional[int]) -> str:
+    """
+    Return a SQL expression that rolls H3 cell IDs up to `max_resolution`
+    using the 64-bit H3 index bit layout (resolution in bits 52..55; unused
+    child digits set to 0b111).
+    """
+    if max_resolution is None or max_resolution >= 8:
+        return "h3_index"
+    res = max(0, min(8, int(max_resolution)))
+    return (
+        f"CASE WHEN substr(h3_index, 2, 1)::INTEGER <= {res} THEN h3_index "
+        f"ELSE lower(printf('%x', "
+        f"((('0x' || h3_index)::UBIGINT & ~(15::UBIGINT << 52)) "
+        f"| ({res}::UBIGINT << 52) "
+        f"| ((1::UBIGINT << (3 * (15 - {res}))) - 1))"
+        f")) END"
+    )
+
+
+def _build_spatial_where_clause(
+    aoi_dict: Dict,
+    date_start: str,
+    date_end: str,
+    count_col: str,
+    viewport_bbox: Optional[Tuple[float, float, float, float]] = None,
+) -> Tuple[List[str], List, bool]:
+    """
+    Build shared WHERE predicates & parameters for spatial summary and KPI queries,
+    enforcing AOI boundaries, optional viewport bounds, and weekly-bucket safety.
+    """
+    aoi_sql, aoi_params, is_empty = db_engine.get_aoi_sql_filter(aoi_dict)
+    if is_empty:
+        return ([], [], True)
+
+    where_clauses: List[str] = []
+    params: List = []
+
+    if aoi_sql:
+        where_clauses.append(aoi_sql)
+        params.extend(aoi_params)
+
+    vp_sql, vp_params = _viewport_sql_filter(viewport_bbox)
+    if vp_sql:
+        where_clauses.append(vp_sql)
+        params.extend(vp_params)
+
+    # Outside the study area a whole week of detections is stored on that
+    # week's Monday. A window shorter than a week must not show such a bucket
+    # unless it covers the bucket's full week (cut short where the data ends):
+    # otherwise a single Monday would display seven days of fires.
+    date_filter = "acq_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)"
+    date_params: List = [date_start, date_end]
+    window_days = (_parse_iso_date(date_end) - _parse_iso_date(date_start)).days + 1
+    if _weekly_buckets_outside_study_area() and window_days < 7:
+        _, data_max = _get_dataset_date_bounds()
+        date_filter = f"""(
+            ({_FINE_CELL_SQL} AND acq_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE))
+            OR (NOT {_FINE_CELL_SQL}
+                AND acq_date >= CAST(? AS DATE)
+                AND LEAST(acq_date + INTERVAL 6 DAY, CAST(? AS DATE)) <= CAST(? AS DATE))
+        )"""
+        date_params = [
+            date_start,
+            date_end,
+            date_start,
+            data_max.isoformat(),
+            date_end,
+        ]
+
+    where_clauses.append(date_filter)
+    params.extend(date_params)
+    where_clauses.append(f"{count_col} > 0")
+    return (where_clauses, params, False)
+
+
 def query_spatial_summary(
     aoi_dict: Dict,
     date_start: str,
     date_end: str,
     sensor_mode: str,
+    max_resolution: Optional[int] = None,
+    viewport_bbox: Optional[Tuple[float, float, float, float]] = None,
 ) -> SpatialSummaryResponse:
     """
     Endpoint 1: Aggregate H3 hexagonal grid fire counts and mean FRP within the AOI
-    and requested [date_start, date_end] window.
+    and requested [date_start, date_end] window, optionally rolled up to
+    `max_resolution` and clipped to `viewport_bbox`.
     """
-    matching_cells = db_engine.get_matching_h3_cells(aoi_dict)
-    if not matching_cells:
-        return SpatialSummaryResponse(status="success", data=[])
-
     count_col, frp_col = SENSOR_COLUMN_MAP.get(
         sensor_mode, SENSOR_COLUMN_MAP["harmonized"]
     )
+    where_clauses, params, is_empty = _build_spatial_where_clause(
+        aoi_dict=aoi_dict,
+        date_start=date_start,
+        date_end=date_end,
+        count_col=count_col,
+        viewport_bbox=viewport_bbox,
+    )
+    if is_empty:
+        return SpatialSummaryResponse(status="success", data=[])
 
     cur = db_engine.cursor()
+    cell_expr = _h3_group_expr(max_resolution)
     sql = f"""
         SELECT
-            h3_index,
+            {cell_expr} AS cell_id,
             CAST(SUM({count_col}) AS INTEGER) AS total_fires,
             ROUND(
                 SUM({frp_col} * {count_col}) / NULLIF(SUM({count_col}), 0),
                 2
             ) AS mean_frp
         FROM harmonized_fires
-        WHERE h3_index IN (SELECT UNNEST(?::VARCHAR[]))
-          AND acq_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
-          AND {count_col} > 0
-        GROUP BY h3_index
+        WHERE {' AND '.join(where_clauses)}
+        GROUP BY cell_id
         ORDER BY total_fires DESC
     """
-    rows = cur.execute(sql, [matching_cells, date_start, date_end]).fetchall()
+    rows = cur.execute(sql, params).fetchall()
 
     records = [
-        SpatialHexRecord(
+        SpatialHexRecord.model_construct(
             h3_index=str(r[0]),
             total_fires=int(r[1]),
             mean_frp=round(float(r[2] or 0.0), 2),
@@ -132,6 +264,54 @@ def query_spatial_summary(
         for r in rows
     ]
     return SpatialSummaryResponse(status="success", data=records)
+
+
+def query_kpi_summary(
+    aoi_dict: Dict,
+    date_start: str,
+    date_end: str,
+    sensor_mode: str,
+) -> KPISummaryResponse:
+    """
+    Aggregate headline AOI metrics directly in DuckDB without serializing
+    hundreds of thousands of per-hex records over multi-year windows.
+    """
+    count_col, frp_col = SENSOR_COLUMN_MAP.get(
+        sensor_mode, SENSOR_COLUMN_MAP["harmonized"]
+    )
+    where_clauses, params, is_empty = _build_spatial_where_clause(
+        aoi_dict=aoi_dict,
+        date_start=date_start,
+        date_end=date_end,
+        count_col=count_col,
+    )
+    if is_empty:
+        return KPISummaryResponse(
+            status="success",
+            total_fires=0,
+            active_zones=0,
+            mean_frp=0.0,
+        )
+
+    cur = db_engine.cursor()
+    sql = f"""
+        SELECT
+            COALESCE(CAST(SUM({count_col}) AS BIGINT), 0) AS total_fires,
+            CAST(COUNT(DISTINCT h3_index) AS INTEGER) AS active_zones,
+            COALESCE(
+                ROUND(SUM({frp_col} * {count_col}) / NULLIF(SUM({count_col}), 0), 2),
+                0.0
+            ) AS mean_frp
+        FROM harmonized_fires
+        WHERE {' AND '.join(where_clauses)}
+    """
+    row = cur.execute(sql, params).fetchone()
+    return KPISummaryResponse(
+        status="success",
+        total_fires=int(row[0] or 0) if row else 0,
+        active_zones=int(row[1] or 0) if row else 0,
+        mean_frp=round(float(row[2] or 0.0), 2) if row else 0.0,
+    )
 
 
 def _get_dataset_date_bounds() -> Tuple[date, date]:
@@ -189,7 +369,8 @@ def _trimmed_mean_and_std(values: np.ndarray, floor_ratio: float = 0.18) -> Tupl
 
 def _compute_weekly_context(
     cur,
-    matching_cells: List[str],
+    aoi_sql: Optional[str],
+    aoi_params: List,
     count_col: str,
     sensor_mode: str,
 ) -> Tuple[Dict[date, int], Dict[int, float], Dict[int, float]]:
@@ -198,17 +379,19 @@ def _compute_weekly_context(
     baselines across actual dataset years (with circular seasonal smoothing
     when fewer than 3 years exist in the dataset).
     """
+    where_parts = [f"{count_col} > 0"]
+    if aoi_sql:
+        where_parts.insert(0, aoi_sql)
     sql = f"""
         SELECT
             DATE_TRUNC('week', acq_date)::DATE AS wk_monday,
             CAST(SUM({count_col}) AS INTEGER) AS weekly_count
         FROM harmonized_fires
-        WHERE h3_index IN (SELECT UNNEST(?::VARCHAR[]))
-          AND {count_col} > 0
+        WHERE {' AND '.join(where_parts)}
         GROUP BY wk_monday
         ORDER BY wk_monday
     """
-    rows = cur.execute(sql, [matching_cells]).fetchall()
+    rows = cur.execute(sql, aoi_params).fetchall()
 
     week_date_map: Dict[date, int] = {}
     by_year_week: Dict[Tuple[int, int], int] = {}
@@ -267,8 +450,8 @@ def query_calendar_series(
     Endpoint 2: Compute ISO weekly time-series, climatological baseline
     (historical_mean), Z-score anomaly flags (Z > 2.0), and Critical Fire Season bounds.
     """
-    matching_cells = db_engine.get_matching_h3_cells(aoi_dict)
-    if not matching_cells:
+    aoi_sql, aoi_params, is_empty = db_engine.get_aoi_sql_filter(aoi_dict)
+    if is_empty:
         return CalendarSeriesResponse(
             status="success",
             summary=CalendarSeasonSummary(
@@ -283,7 +466,7 @@ def query_calendar_series(
     )
     cur = db_engine.cursor()
     week_date_map, weekly_means, weekly_stds = _compute_weekly_context(
-        cur, matching_cells, count_col, sensor_mode
+        cur, aoi_sql, aoi_params, count_col, sensor_mode
     )
     crit_start, crit_end = _detect_critical_fire_season(weekly_means)
 
@@ -332,23 +515,30 @@ def query_calendar_series(
 
 def _query_daily_trend(
     cur,
-    matching_cells: List[str],
+    aoi_sql: Optional[str],
+    aoi_params: List,
     count_col: str,
     sensor_mode: str,
     dt_start: date,
     dt_end: date,
 ) -> List[TrendPoint]:
+    # A day-by-day series can only be drawn from cells that are stored daily.
+    daily_cells_filter = (
+        _FINE_CELL_SQL if _weekly_buckets_outside_study_area() else "TRUE"
+    )
+    where_parts = [f"{count_col} > 0", daily_cells_filter]
+    if aoi_sql:
+        where_parts.insert(0, aoi_sql)
     sql = f"""
         SELECT
             acq_date::DATE AS obs_day,
             CAST(SUM({count_col}) AS INTEGER) AS daily_count
         FROM harmonized_fires
-        WHERE h3_index IN (SELECT UNNEST(?::VARCHAR[]))
-          AND {count_col} > 0
+        WHERE {' AND '.join(where_parts)}
         GROUP BY obs_day
         ORDER BY obs_day
     """
-    rows = cur.execute(sql, [matching_cells]).fetchall()
+    rows = cur.execute(sql, aoi_params).fetchall()
     daily_map: Dict[date, int] = {}
     for r in rows:
         d = r[0].date() if isinstance(r[0], datetime) else r[0]
@@ -416,24 +606,27 @@ def _query_daily_trend(
 
 def _query_monthly_trend(
     cur,
-    matching_cells: List[str],
+    aoi_sql: Optional[str],
+    aoi_params: List,
     count_col: str,
     sensor_mode: str,
     dt_start: date,
     dt_end: date,
 ) -> List[TrendPoint]:
+    where_parts = [f"{count_col} > 0"]
+    if aoi_sql:
+        where_parts.insert(0, aoi_sql)
     sql = f"""
         SELECT
             CAST(EXTRACT(YEAR FROM acq_date) AS INTEGER) AS yr,
             CAST(EXTRACT(MONTH FROM acq_date) AS INTEGER) AS mo,
             CAST(SUM({count_col}) AS INTEGER) AS monthly_count
         FROM harmonized_fires
-        WHERE h3_index IN (SELECT UNNEST(?::VARCHAR[]))
-          AND {count_col} > 0
+        WHERE {' AND '.join(where_parts)}
         GROUP BY yr, mo
         ORDER BY yr, mo
     """
-    rows = cur.execute(sql, [matching_cells]).fetchall()
+    rows = cur.execute(sql, aoi_params).fetchall()
     monthly_map: Dict[Tuple[int, int], int] = {
         (int(r[0]), int(r[1])): int(r[2]) for r in rows
     }
@@ -499,24 +692,27 @@ def _query_monthly_trend(
 
 def _query_multiyear_trend(
     cur,
-    matching_cells: List[str],
+    aoi_sql: Optional[str],
+    aoi_params: List,
     count_col: str,
     sensor_mode: str,
     dt_start: date,
     dt_end: date,
     span_years: int,
 ) -> List[TrendPoint]:
+    where_parts = [f"{count_col} > 0"]
+    if aoi_sql:
+        where_parts.insert(0, aoi_sql)
     sql = f"""
         SELECT
             CAST(EXTRACT(YEAR FROM acq_date) AS INTEGER) AS yr,
             CAST(SUM({count_col}) AS INTEGER) AS yr_count
         FROM harmonized_fires
-        WHERE h3_index IN (SELECT UNNEST(?::VARCHAR[]))
-          AND {count_col} > 0
+        WHERE {' AND '.join(where_parts)}
         GROUP BY yr
         ORDER BY yr
     """
-    rows = cur.execute(sql, [matching_cells]).fetchall()
+    rows = cur.execute(sql, aoi_params).fetchall()
     yearly_map: Dict[int, int] = {int(r[0]): int(r[1]) for r in rows}
 
     min_yr, max_yr = _get_dataset_year_bounds(sensor_mode)
@@ -573,8 +769,8 @@ def query_trend_series(
     Endpoint 3: Compute gap-filled chronological fire activity trend series and
     seasonal baselines at daily, weekly, monthly, yearly, 5-year, or 10-year intervals.
     """
-    matching_cells = db_engine.get_matching_h3_cells(aoi_dict)
-    if not matching_cells:
+    aoi_sql, aoi_params, is_empty = db_engine.get_aoi_sql_filter(aoi_dict)
+    if is_empty:
         return TrendSeriesResponse(
             status="success", granularity=granularity, time_series=[]
         )
@@ -587,11 +783,11 @@ def query_trend_series(
 
     if granularity == "daily":
         series = _query_daily_trend(
-            cur, matching_cells, count_col, sensor_mode, dt_start, dt_end
+            cur, aoi_sql, aoi_params, count_col, sensor_mode, dt_start, dt_end
         )
     elif granularity == "weekly":
         week_date_map, weekly_means, weekly_stds = _compute_weekly_context(
-            cur, matching_cells, count_col, sensor_mode
+            cur, aoi_sql, aoi_params, count_col, sensor_mode
         )
         curr_monday = dt_start - timedelta(days=dt_start.weekday())
         series = []
@@ -622,13 +818,14 @@ def query_trend_series(
             curr_monday += timedelta(days=7)
     elif granularity == "monthly":
         series = _query_monthly_trend(
-            cur, matching_cells, count_col, sensor_mode, dt_start, dt_end
+            cur, aoi_sql, aoi_params, count_col, sensor_mode, dt_start, dt_end
         )
     else:
         span_map = {"yearly": 1, "5y": 5, "10y": 10}
         series = _query_multiyear_trend(
             cur,
-            matching_cells,
+            aoi_sql,
+            aoi_params,
             count_col,
             sensor_mode,
             dt_start,

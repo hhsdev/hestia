@@ -15,7 +15,11 @@ frontend/dist/
 # Data volume outputs (keep folder structure, ignore large datasets)
 data/**/*.parquet
 data/**/*.json
-data/raw/*.csv
+# The pre-built global dataset ships with the backend so the deployment can
+# serve it without running the ETL.
+!backend/data/*.parquet
+!backend/data/metadata.json
+data/raw/*
 !data/raw/.gitkeep
 
 # OS / IDE
